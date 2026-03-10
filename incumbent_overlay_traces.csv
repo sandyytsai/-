@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+from typing import List, Tuple
+
+from .data_contract import ModelData
+
+
+def validate_data(data: ModelData) -> None:
+    if data.T <= 0:
+        raise ValueError("T must be >= 1")
+    if data.N <= 0:
+        raise ValueError("N must be >= 1")
+    if not (1 <= data.Nmax_on <= data.N):
+        raise ValueError("Nmax_on must satisfy 1 <= Nmax_on <= N")
+
+    if data.E1_kwh <= 0:
+        raise ValueError("E1_kwh must be > 0")
+    if data.Emax_kwh_per_pump < data.E1_kwh:
+        raise ValueError("Emax_kwh_per_pump must be >= E1_kwh")
+
+    if len(data.Vc_m3) != data.T:
+        raise ValueError("Vc_m3 length must be T")
+    if len(data.pv_total_kwh) != data.T:
+        raise ValueError("pv_total_kwh length must be T")
+    if len(data.grid_price) != data.T:
+        raise ValueError("grid_price length must be T")
+    if len(data.sell_price) != data.T:
+        raise ValueError("sell_price length must be T")
+
+    if not (data.Vmin_m3 <= data.V0_m3 <= data.Vmax_m3):
+        raise ValueError("V0_m3 must satisfy Vmin_m3 <= V0_m3 <= Vmax_m3")
+    if data.Vmin_m3 >= data.Vmax_m3:
+        raise ValueError("Vmin_m3 must be < Vmax_m3")
+
+    if len(data.E_bp_kwh) != len(data.Q_bp_m3):
+        raise ValueError("E_bp_kwh and Q_bp_m3 must have same length")
+    if len(data.E_bp_kwh) < 2:
+        raise ValueError("Need at least 2 breakpoints for PWL curve")
+
+    for i in range(len(data.E_bp_kwh) - 1):
+        if not (data.E_bp_kwh[i] < data.E_bp_kwh[i + 1]):
+            raise ValueError("E_bp_kwh must be strictly increasing")
+
+    if any(x < 0 for x in data.pv_total_kwh):
+        raise ValueError("pv_total_kwh must be >= 0")
+
+
+def maybe_add_e1_breakpoint(
+    E_bp_kwh: List[float],
+    Q_bp_m3: List[float],
+    E1_kwh: float,
+    Q_at_E1_m3: float = 0.0
+) -> Tuple[List[float], List[float]]:
+    """
+    Optional convenience: ensure (E1, Q_at_E1) is in the breakpoint list.
+    If E1 already exists (exact float equality), do nothing.
+    If E1 lies within the range, insert it keeping E strictly increasing.
+    """
+    if E1_kwh in E_bp_kwh:
+        return E_bp_kwh, Q_bp_m3
+
+    if E1_kwh < E_bp_kwh[0] or E1_kwh > E_bp_kwh[-1]:
+        # Don't insert outside range; user should expand curve.
+        return E_bp_kwh, Q_bp_m3
+
+    idx = 0
+    while idx < len(E_bp_kwh) and E_bp_kwh[idx] < E1_kwh:
+        idx += 1
+
+    E_new = E_bp_kwh[:idx] + [E1_kwh] + E_bp_kwh[idx:]
+    Q_new = Q_bp_m3[:idx] + [Q_at_E1_m3] + Q_bp_m3[idx:]
+    return E_new, Q_new

@@ -1,0 +1,19 @@
+from __future__ import annotations
+
+from typing import Tuple
+
+from ortools.sat.python import cp_model
+
+from .data_contract import SolverConfig
+
+
+def solve_model(
+    model: cp_model.CpModel,
+    cfg: SolverConfig,
+) -> Tuple[cp_model.CpSolver, int]:
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = cfg.time_limit_s
+    solver.parameters.num_search_workers = cfg.num_workers
+    solver.parameters.log_search_progress = cfg.log_search_progress
+    status = solver.Solve(model)
+    return solver, status

@@ -1,0 +1,363 @@
+"""
+Farm Irrigation PV Optimization Server
+Integrates the PoY-Solaqua optimization algorithm
+"""
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from typing import List, Dict, Union
+import sys
+import os
+
+# Add the path to your PoY-Solaqua repository
+# Adjust this path to wherever you cloned the repo
+sys.path.insert(0, 'C:\\Users\\lizac\\Poy-Solaqua') # change path
+
+from solver import ModelData, run_optimization, Scales, SolverConfig
+
+app = Flask(__name__)
+CORS(app)
+
+# ============================================================================
+# SYSTEM PARAMETERS (Configure these based on your irrigation system)
+# ============================================================================
+
+# Pump system parameters
+NUM_PUMPS = 6  # Number of pumps
+MAX_PUMPS_ON = 6  # Max pumps that can run simultaneously
+
+# Energy storage (battery/capacitor)
+E1_KWH = 97.86  # Energy stored at start
+EMAX_KWH_PER_PUMP = 160.3  # Max energy per pump
+
+# Pond storage
+V0_M3 = 20000.0  # Initial pond volume
+VMIN_M3 = 10000.0  # Min pond volume
+VMAX_M3 = 100000.0  # Max pond volume
+
+# Pump curve breakpoints (per pump, per hour)
+# These define the relationship between power (kW) and flow (m³/h)
+E_BP_KWH = [97.86, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.3]
+Q_BP_M3 = [87.299, 124.0, 295.5, 467.0, 638.5, 810.0, 981.5, 1158.145]
+
+# Pricing
+PPA_PRICE = 0.05  # Cost per kWh from solar (currency per kWh)
+GRID_PRICE_DEFAULT = 0.12  # Cost per kWh from grid (currency per kWh)
+SELL_PRICE_DEFAULT = 0.10  # Revenue per kWh exported (currency per kWh)
+
+# Weather data (placeholder - you may want to integrate weather API)
+PV_OUTPUT_HOURLY = [0] * 72  # Will be set based on input or forecast
+PRECIPITATION_HOURLY = [0] * 72  # m³/h
+EVAPORATION_HOURLY = [0.5] * 72  # m³/h (rough estimate)
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def normalize_to_hourly(
+    water_demand: Union[float, List[float], Dict[str, float]],
+    input_mode: str
+) -> List[float]:
+    """Convert water demand to hourly format (72 values)"""
+    if input_mode == "single":
+        # Single average: distribute evenly across 72 hours
+        avg = float(water_demand)
+        return [avg / 72] * 72
+    
+    elif input_mode == "periods":
+        # 3 periods of 24 hours each
+        hourly = []
+        hourly.extend([float(water_demand['period1']) / 24] * 24)
+        hourly.extend([float(water_demand['period2']) / 24] * 24)
+        hourly.extend([float(water_demand['period3']) / 24] * 24)
+        return hourly
+    
+    elif input_mode == "hourly":
+        # Already hourly
+        return [float(v) for v in water_demand]
+    
+    elif input_mode == "intervals":
+        # 288 15-minute intervals: aggregate to hourly
+        hourly = []
+        for hour in range(72):
+            hour_intervals = water_demand[hour * 4:(hour + 1) * 4]
+            hourly_total = sum(float(v) for v in hour_intervals)
+            hourly.append(hourly_total)
+        return hourly
+    
+    else:
+        raise ValueError(f"Unknown input mode: {input_mode}")
+
+
+def generate_pv_forecast(hour_of_day_start: int = 6) -> List[float]:
+    """
+    Generate a simple PV forecast for 72 hours.
+    Peak output during daylight hours (6 AM - 6 PM).
+    
+    TODO: Replace with actual weather forecast API
+    """
+    pv_output = []
+    
+    for hour in range(72):
+        day = hour // 24
+        hour_of_day = hour % 24
+        
+        # Simple sine-wave profile: peak at noon, zero at night
+        if hour_of_day_start <= hour_of_day <= 18:
+            # Hours 6-18: produce power
+            # Peak at hour 12 (noon)
+            from math import sin, pi
+            normalized = (hour_of_day - hour_of_day_start) / (18 - hour_of_day_start)
+            power = 10 * sin(normalized * pi)  # Peak 10 kW
+        else:
+            power = 0
+        
+        pv_output.append(power)
+    
+    return pv_output
+
+
+# ============================================================================
+# MAIN OPTIMIZATION FUNCTION
+# ============================================================================
+
+def optimize_irrigation(
+    field: str,
+    water_demand_hourly: List[float],
+    pv_forecast: List[float] = None,
+    grid_prices: List[float] = None,
+    sell_prices: List[float] = None
+) -> Dict:
+    """
+    Run the PoY-Solaqua optimization algorithm.
+    
+    Args:
+        field: Field identifier
+        water_demand_hourly: List of 72 hourly water demand values (m³/h)
+        pv_forecast: List of 72 hourly PV output values (kWh) - if None, uses default
+        grid_prices: List of 72 hourly grid prices - if None, uses default
+        sell_prices: List of 72 hourly sell prices - if None, uses default
+    
+    Returns:
+        Formatted optimization results
+    """
+    T = 72
+    
+    # Use provided or default values
+    if pv_forecast is None:
+        pv_forecast = generate_pv_forecast()
+    if grid_prices is None:
+        grid_prices = [GRID_PRICE_DEFAULT] * T
+    if sell_prices is None:
+        sell_prices = [SELL_PRICE_DEFAULT] * T
+    
+    # Calculate pond volume change (Vc = rain - demand - evaporation)
+    Vc_m3 = [
+        PRECIPITATION_HOURLY[i] - water_demand_hourly[i] - EVAPORATION_HOURLY[i]
+        for i in range(T)
+    ]
+    
+    # Create ModelData
+    data = ModelData(
+        T=T,
+        N=NUM_PUMPS,
+        Nmax_on=MAX_PUMPS_ON,
+        E1_kwh=E1_KWH,
+        Emax_kwh_per_pump=EMAX_KWH_PER_PUMP,
+        E_bp_kwh=E_BP_KWH,
+        Q_bp_m3=Q_BP_M3,
+        V0_m3=V0_M3,
+        Vmin_m3=VMIN_M3,
+        Vmax_m3=VMAX_M3,
+        Vc_m3=Vc_m3,
+        pv_total_kwh=pv_forecast,
+        grid_price=grid_prices,
+        sell_price=sell_prices,
+        ppa_price=PPA_PRICE,
+    )
+    
+    # Scaling configuration
+    scales = Scales(
+        E_SCALE=1000,     # kWh -> Wh
+        V_SCALE=1,        # m3 -> m3
+        COST_SCALE=1000   # currency -> milli-currency
+    )
+    
+    # Solver configuration
+    cfg = SolverConfig(
+        time_limit_s=20.0,
+        num_workers=8,
+        log_search_progress=False
+    )
+    
+    # Run optimization
+    print(f"Running optimization for {field}...")
+    sol = run_optimization(
+        data=data,
+        scales=scales,
+        cfg=cfg,
+        symmetry_breaking=True,
+        ensure_e1_breakpoint=True,
+        include_per_pump=True,
+    )
+    
+    print(f"Optimization complete. Status: {sol.status}")
+    
+    if sol.objective_currency is None:
+        raise ValueError("Optimization failed to find a solution")
+    
+    # Build schedule
+    schedule = []
+    for hour in range(T):
+        from datetime import datetime, timedelta
+        timestamp = datetime.now() + timedelta(hours=hour)
+        
+        schedule.append({
+            "timestamp": timestamp.isoformat(),
+            "hour": hour,
+            "pumpId": f"{field}_system",
+            "pumpsOn": int(sol.n_on[hour]),
+            "status": "on" if sol.n_on[hour] > 0 else "off",
+            "powerOutput": float(sol.e_pv_kwh[hour] + sol.e_g_kwh[hour]),
+            "pvPowerUsed": float(sol.e_pv_kwh[hour]),
+            "gridPowerUsed": float(sol.e_g_kwh[hour]),
+            "waterPumped": float(sol.Vpump_m3[hour]),
+            "pondVolume": float(sol.V_m3[hour]),
+            "exportedEnergy": float(sol.export_kwh[hour]),
+        })
+    
+    # Calculate total cost
+    hourly_cost = [
+        sol.e_pv_kwh[i] * PPA_PRICE
+        + sol.e_g_kwh[i] * grid_prices[i]
+        - sol.export_kwh[i] * sell_prices[i]
+        for i in range(T)
+    ]
+    total_cost = sum(hourly_cost)
+    
+    # Calculate efficiency
+    total_pv_used = sum(sol.e_pv_kwh)
+    total_energy = total_pv_used + sum(sol.e_g_kwh)
+    efficiency = (total_pv_used / total_energy * 100) if total_energy > 0 else 0
+    
+    return {
+        "schedule": schedule,
+        "totalWaterUsed": sum(water_demand_hourly),
+        "totalEnergyGenerated": sum(sol.e_pv_kwh),
+        "totalEnergyFromGrid": sum(sol.e_g_kwh),
+        "totalEnergyExported": sum(sol.export_kwh),
+        "efficiency": float(efficiency),
+        "totalCost": float(total_cost),
+        "status": sol.status,
+        "recommendations": [
+            f"System operates {efficiency:.1f}% on renewable PV energy",
+            f"Total water pumped: {sum(water_demand_hourly):.1f} m³",
+            f"Estimated cost: {total_cost:.2f} currency units",
+            "Monitor pond levels to ensure adequate water supply"
+        ]
+    }
+
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.route('/optimize', methods=['POST'])
+def optimize():
+    """
+    Main optimization endpoint.
+    Accepts water demand in 4 formats and returns optimized schedule.
+    """
+    try:
+        data = request.json
+        
+        # Validate
+        if not data.get('field') or not data.get('inputMode') or data.get('waterDemand') is None:
+            return jsonify({
+                'error': 'Missing required fields: field, inputMode, waterDemand'
+            }), 400
+        
+        field = data['field']
+        input_mode = data['inputMode']
+        water_demand = data['waterDemand']
+        
+        print(f"\nOptimization Request: {field} ({input_mode})")
+        
+        # Normalize to hourly
+        hourly_demand = normalize_to_hourly(water_demand, input_mode)
+        
+        # Optional: Use provided pricing/weather data or defaults
+        pv_forecast = data.get('pvForecast')
+        grid_prices = data.get('gridPrices')
+        sell_prices = data.get('sellPrices')
+        
+        # Run optimization
+        result = optimize_irrigation(
+            field=field,
+            water_demand_hourly=hourly_demand,
+            pv_forecast=pv_forecast,
+            grid_prices=grid_prices,
+            sell_prices=sell_prices
+        )
+        
+        # Format response
+        response = {
+            'field': field,
+            'schedule': result['schedule'],
+            'totalWaterUsed': result['totalWaterUsed'],
+            'totalEnergyGenerated': result['totalEnergyGenerated'],
+            'totalEnergyFromGrid': result['totalEnergyFromGrid'],
+            'totalEnergyExported': result['totalEnergyExported'],
+            'efficiency': result['efficiency'],
+            'totalCost': result['totalCost'],
+            'status': result['status'],
+            'recommendations': result['recommendations']
+        }
+        
+        return jsonify(response), 200
+    
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'error': 'Optimization failed',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/test', methods=['GET'])
+def test():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'OK',
+        'message': 'PoY-Solaqua server is running',
+        'endpoints': {
+            'optimize': 'POST /optimize',
+            'test': 'GET /test'
+        }
+    }), 200
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == '__main__':
+    print("""
+    ╔══════════════════════════════════════════════════════════════╗
+    ║     Farm Irrigation PV Optimization Server                  ║
+    ║     (PoY-Solaqua Solver Integration)                        ║
+    ║                                                              ║
+    ║     Server running on: http://localhost:8000                ║
+    ║                                                              ║
+    ║     Make sure:                                              ║
+    ║     1. Update sys.path to point to your PoY-Solaqua repo    ║
+    ║     2. Install dependencies: pip install flask flask-cors   ║
+    ║     3. Have the solver module properly installed            ║
+    ╚══════════════════════════════════════════════════════════════╝
+    """)
+    
+    app.run(host='localhost', port=8000, debug=True)
+
+
